@@ -1,0 +1,1 @@
+# MAHED-shared-task-Multimodal-detection-of-hope-and-hate-emotions-in-arabic-content

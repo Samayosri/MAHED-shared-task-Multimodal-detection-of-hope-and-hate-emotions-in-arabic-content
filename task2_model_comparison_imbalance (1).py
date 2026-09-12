@@ -1,284 +1,310 @@
-# MARBERT Fine-Tuned Multi-Head Multi-Task Classification
-# One shared MARBERT backbone + Emotion/Offensive/Hate heads
-# MARBERT is fine-tuned end-to-end.
-import re, unicodedata, random
-import numpy as np, pandas as pd, torch, torch.nn as nn, nltk
+# MARBERT + 2x BiLSTM + Attention + Multi-Head Multi-Task
+import re, random
+import numpy as np, pandas as pd, torch, torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, classification_report
 from sklearn.utils.class_weight import compute_class_weight
 from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
-from torch.optim import AdamW
 from arabert.preprocess import ArabertPreprocessor
 
-nltk.download("stopwords", quiet=True)
-
-# 1. Reproducibility + device
+# 1. SEED
 SEED = 42
-random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
-if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED)
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", device)
 
-# 2. Load data + preprocessing
-df = pd.read_csv("train.csv")
-print("Dataset shape:", df.shape); print(df.head())
+# 2. CONFIGURATION
+MARBERT_MODEL_NAME = "UBC-NLP/MARBERT"
+MAX_LENGTH, BATCH_SIZE, EPOCHS = 128, 16, 8
+MARBERT_LR, LSTM_LR = 1e-5, 2e-4
+WEIGHT_DECAY, DROPOUT, LSTM_HIDDEN_SIZE, GRADIENT_CLIP = 0.01, 0.30, 256, 1.0
+LOSS_WEIGHTS = {"Emotion": 1.5, "Offensive": 1.0, "Hate": 1.0}   # Emotion gets more weight
 
-ARABERT_MODEL_NAME = "aubmindlab/bert-base-arabertv02-twitter"
-_arabert_preprocessor = ArabertPreprocessor(model_name=ARABERT_MODEL_NAME)
+# 3. LOAD DATA
+df = pd.read_csv("train.csv")
+print(df.head()); print(df.columns)
+
+# 4. PREPROCESSING
+arabert_preprocessor = ArabertPreprocessor(model_name="aubmindlab/bert-base-arabertv02-twitter")
 
 def preprocess_text(text):
     text = str(text)
-    text = re.sub(r'https?://\S+|www\.\S+', ' ', text)                   # Remove URLs
-    text = re.sub(r'@\S+', ' ', text)                                     # Remove mentions
-    text = re.sub(r'(.)\1{2,}', r'\1', text)                              # Reduce repeated chars
-    text = "".join(c for c in text if unicodedata.category(c) != "So")    # Remove symbols/emojis
-    return _arabert_preprocessor.preprocess(text)                         # AraBERT preprocessing
+    text = re.sub(r'https?://\S+|www\.\S+', '', text)              # Remove URLs
+    text = re.sub(r'@\S+', '', text)                                # Remove mentions
+    text = re.sub(r'(.)\1{2,}', r'\1', text)                        # Reduce repeated chars
+    text = ''.join(ch for ch in text                               # Remove emoji/symbols
+                   if not (0x1F300 <= ord(ch) <= 0x1FAFF))
+    return arabert_preprocessor.preprocess(text)                    # AraBERT preprocessing
 
-df["clean_text"] = df["text"].apply(preprocess_text)
-print(df[["text", "clean_text"]].head())
+df["text"] = df["text"].fillna("").apply(preprocess_text)
+print(df[["text", "Emotion", "Offensive", "Hate"]].head())
 
-# 3. MARBERT tokenizer
-MARBERT_MODEL_NAME = "UBC-NLP/MARBERT"
+# 5. LABEL ENCODING
+LABELS = ["Emotion", "Offensive", "Hate"]
+label_maps, num_classes = {}, {}
+
+for label in LABELS:
+    df[label] = df[label].astype(str)                               # Avoid mixed-type issues
+    unique_labels = sorted(df[label].unique())
+    label_maps[label] = {name: idx for idx, name in enumerate(unique_labels)}
+    df[label + "_label"] = df[label].map(label_maps[label])
+    num_classes[label] = len(unique_labels)
+    print(f"{label}: {num_classes[label]} classes"); print(label_maps[label])
+
+# 6. TRAIN / VALIDATION / TEST SPLIT
+train_df, temp_df = train_test_split(df, test_size=0.20, random_state=SEED, shuffle=True)
+val_df, test_df = train_test_split(temp_df, test_size=0.50, random_state=SEED, shuffle=True)
+print("\nDataset sizes:")
+print("Train:", len(train_df)); print("Validation:", len(val_df)); print("Test:", len(test_df))
+
+# 7. TOKENIZER
 tokenizer = AutoTokenizer.from_pretrained(MARBERT_MODEL_NAME)
 
-# 4. Labels
-LABEL_COLS = ["Emotion", "Offensive", "Hate"]
-label_mappings, num_classes = {}, {}
-
-for label in LABEL_COLS:
-    unique_labels = sorted(df[label].dropna().unique())
-    label2id = {v: i for i, v in enumerate(unique_labels)}
-    id2label = {i: v for v, i in label2id.items()}
-    label_mappings[label] = {"label2id": label2id, "id2label": id2label}
-    num_classes[label] = len(unique_labels)
-    print(f"{label}: {unique_labels}")
-
-# 5. Dataset
+# 8. DATASET
 class MultiTaskDataset(Dataset):
-    def __init__(self, dataframe, tokenizer, label_mappings, max_length=64):
+    def __init__(self, dataframe, tokenizer, max_length=128):
         self.df = dataframe.reset_index(drop=True)
-        self.tokenizer, self.label_mappings, self.max_length = tokenizer, label_mappings, max_length
+        self.tokenizer, self.max_length = tokenizer, max_length
 
     def __len__(self): return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        encoding = self.tokenizer(row["clean_text"], padding="max_length", truncation=True,
+        encoding = self.tokenizer(row["text"], truncation=True, padding="max_length",
                                   max_length=self.max_length, return_tensors="pt")
-        item = {k: v.squeeze(0) for k, v in encoding.items()}
-        # Missing labels = -1 (ignored during loss)
-        for label in LABEL_COLS:
-            value = row[label]
-            item[f"{label}_label"] = torch.tensor(
-                -1 if pd.isna(value) else self.label_mappings[label]["label2id"][value],
-                dtype=torch.long)
+        item = {"input_ids": encoding["input_ids"].squeeze(0),
+                "attention_mask": encoding["attention_mask"].squeeze(0)}
+        if "token_type_ids" in encoding:
+            item["token_type_ids"] = encoding["token_type_ids"].squeeze(0)
+        for label in LABELS:
+            value = row[label + "_label"]
+            item[label] = torch.tensor(-1 if pd.isna(value) else int(value), dtype=torch.long)
         return item
 
-# 6. Multi-head MARBERT
-class MARBERTMultiHead(nn.Module):
-    def __init__(self, num_classes, dropout=0.3):
+# 9. MODEL
+class MARBERT_BiLSTM_MultiHead(nn.Module):
+    def __init__(self, num_classes, lstm_hidden_size=256, dropout=0.3):
         super().__init__()
         self.marbert = AutoModel.from_pretrained(MARBERT_MODEL_NAME)
-        hidden_size = self.marbert.config.hidden_size
-        self.dropout = nn.Dropout(dropout)
-        # Three task-specific heads
-        self.emotion_head = nn.Linear(hidden_size, num_classes["Emotion"])
-        self.offensive_head = nn.Linear(hidden_size, num_classes["Offensive"])
-        self.hate_head = nn.Linear(hidden_size, num_classes["Hate"])
+        marbert_hidden_size = self.marbert.config.hidden_size
 
-    def mean_pool(self, hidden_states, attention_mask):
-        mask = attention_mask.unsqueeze(-1).float()
-        return (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+        # Two stacked BiLSTMs
+        self.lstm1 = nn.LSTM(marbert_hidden_size, lstm_hidden_size, num_layers=1,
+                             batch_first=True, bidirectional=True)
+        self.dropout1 = nn.Dropout(dropout)
+        self.lstm2 = nn.LSTM(lstm_hidden_size * 2, lstm_hidden_size, num_layers=1,
+                             batch_first=True, bidirectional=True)
+        self.dropout2 = nn.Dropout(dropout)
+
+        # Attention
+        self.attention = nn.Linear(lstm_hidden_size * 2, 1)
+
+        # Task heads
+        rep_size = lstm_hidden_size * 2
+        def make_head(n): return nn.Sequential(nn.Linear(rep_size, rep_size), nn.ReLU(),
+                                               nn.Dropout(dropout), nn.Linear(rep_size, n))
+        self.emotion_head = make_head(num_classes["Emotion"])
+        self.offensive_head = make_head(num_classes["Offensive"])
+        self.hate_head = make_head(num_classes["Hate"])
+
+    def attention_pooling(self, sequence_output, attention_mask):
+        scores = self.attention(sequence_output).squeeze(-1)
+
+        # Masking + softmax in FP32 to avoid FP16 overflow/underflow
+        scores = scores.float().masked_fill(
+            attention_mask == 0, torch.finfo(torch.float32).min)
+        weights = torch.softmax(scores, dim=1)
+
+        # Back to original dtype before multiplying with LSTM output
+        weights = weights.to(sequence_output.dtype).unsqueeze(-1)
+        return torch.sum(sequence_output * weights, dim=1)
 
     def forward(self, input_ids, attention_mask, token_type_ids=None):
-        # ONE shared MARBERT forward pass
-        outputs = self.marbert(input_ids=input_ids, attention_mask=attention_mask,
-                               token_type_ids=token_type_ids)
-        pooled = self.dropout(self.mean_pool(outputs.last_hidden_state, attention_mask))
+        x = self.marbert(input_ids=input_ids, attention_mask=attention_mask,
+                         token_type_ids=token_type_ids).last_hidden_state
+        x, _ = self.lstm1(x); x = self.dropout1(x)
+        x, _ = self.lstm2(x); x = self.dropout2(x)
+        pooled = self.attention_pooling(x, attention_mask)
         return {"Emotion": self.emotion_head(pooled),
                 "Offensive": self.offensive_head(pooled),
                 "Hate": self.hate_head(pooled)}
 
-# 7. Calculate class weights
-def get_class_weights(dataframe, label):
-    subset = dataframe[dataframe[label].notna()]
-    labels = subset[label].values
-    classes = np.array(sorted(pd.unique(labels)))
-    weights = compute_class_weight(class_weight="balanced", classes=classes, y=labels)
-    label2id = label_mappings[label]["label2id"]
-    weight_tensor = torch.ones(num_classes[label], dtype=torch.float)
-    for cls, weight in zip(classes, weights):
-        weight_tensor[label2id[cls]] = weight
-    return weight_tensor.to(device)
+# 10. CLASS WEIGHTS
+def get_class_weights(dataframe, label, num_classes):
+    y = dataframe[label + "_label"].dropna().astype(int)
+    weights = compute_class_weight(class_weight="balanced", classes=np.arange(num_classes), y=y)
+    return torch.tensor(weights, dtype=torch.float).to(device)
 
-# 8. Multi-task weighted loss
-def calculate_loss(outputs, batch, class_weights):
-    total_loss, active_tasks = 0.0, 0
-    for label in LABEL_COLS:
-        labels = batch[f"{label}_label"]
-        valid_mask = labels != -1                # Only samples with valid labels
+class_weights = {label: get_class_weights(train_df, label, num_classes[label]) for label in LABELS}
+for label in LABELS:
+    print(f"\n{label} class weights:"); print(class_weights[label])
+
+# 11. LOSS FUNCTION
+criterions = {label: nn.CrossEntropyLoss(weight=class_weights[label]) for label in LABELS}
+
+def calculate_loss(logits, batch):
+    losses = []
+    for label in LABELS:
+        labels = batch[label]
+        valid_mask = labels != -1                                    # Ignore missing labels
         if valid_mask.sum() == 0: continue
-        loss_fn = nn.CrossEntropyLoss(weight=class_weights[label])
-        total_loss += loss_fn(outputs[label][valid_mask], labels[valid_mask])
-        active_tasks += 1
-    return None if active_tasks == 0 else total_loss / active_tasks
+        loss = criterions[label](logits[label][valid_mask], labels[valid_mask])
+        losses.append(LOSS_WEIGHTS[label] * loss)                    # Weight Emotion more
+    if len(losses) == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    return torch.stack(losses).mean()
 
-# 9. Validation
-def validate_model(model, val_loader):
+# 12. VALIDATION
+@torch.no_grad()
+def validate_model(model, dataloader):
     model.eval()
-    all_preds = {l: [] for l in LABEL_COLS}
-    all_labels = {l: [] for l in LABEL_COLS}
-    with torch.no_grad():
-        for batch in val_loader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
-                            token_type_ids=batch.get("token_type_ids"))
-            for label in LABEL_COLS:
-                labels = batch[f"{label}_label"]
-                valid_mask = labels != -1
-                if valid_mask.sum() == 0: continue
-                preds = torch.argmax(outputs[label][valid_mask], dim=1)
-                all_preds[label].extend(preds.cpu().numpy())
-                all_labels[label].extend(labels[valid_mask].cpu().numpy())
+    predictions = {l: [] for l in LABELS}
+    targets = {l: [] for l in LABELS}
+    total_loss, batches = 0.0, 0
 
-    results, macro_f1_scores = {}, []
-    for label in LABEL_COLS:
-        if len(all_labels[label]) == 0: continue
+    for batch in dataloader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        token_type_ids = batch.get("token_type_ids")
+        if token_type_ids is not None: token_type_ids = token_type_ids.to(device)
+        labels = {label: batch[label].to(device) for label in LABELS}
+
+        logits = model(input_ids=input_ids, attention_mask=attention_mask,
+                       token_type_ids=token_type_ids)
+        loss = calculate_loss(logits, labels)
+        total_loss += loss.item(); batches += 1
+
+        for label in LABELS:
+            valid_mask = labels[label] != -1
+            if valid_mask.sum() == 0: continue
+            pred = torch.argmax(logits[label], dim=1)
+            predictions[label].extend(pred[valid_mask].detach().cpu().numpy())
+            targets[label].extend(labels[label][valid_mask].detach().cpu().numpy())
+
+    results = {}
+    for label in LABELS:
+        if len(targets[label]) == 0: continue
         results[label] = {
-            "accuracy": accuracy_score(all_labels[label], all_preds[label]),
-            "macro_f1": f1_score(all_labels[label], all_preds[label], average="macro")}
-        macro_f1_scores.append(results[label]["macro_f1"])
-    results["average_macro_f1"] = np.mean(macro_f1_scores)
+            "accuracy": accuracy_score(targets[label], predictions[label]),
+            "macro_f1": f1_score(targets[label], predictions[label], average="macro", zero_division=0)}
+    results["loss"] = total_loss / max(batches, 1)
+    results["average_macro_f1"] = np.mean(
+        [results[label]["macro_f1"] for label in LABELS if label in results])
     return results
 
-# 10. Fine-tune MARBERT
-def train_model(model, train_loader, val_loader, class_weights,
-                epochs=3, learning_rate=2e-5, warmup_ratio=0.1):
-    optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
+# 13. TRAINING
+def train_model(model, train_loader, val_loader, epochs=8):
+    # Different LRs: small for MARBERT, larger for LSTM + heads
+    marbert_params = list(model.marbert.parameters())
+    other_params = (list(model.lstm1.parameters()) + list(model.lstm2.parameters()) +
+                    list(model.attention.parameters()) + list(model.emotion_head.parameters()) +
+                    list(model.offensive_head.parameters()) + list(model.hate_head.parameters()))
+
+    optimizer = torch.optim.AdamW(
+        [{"params": marbert_params, "lr": MARBERT_LR},
+         {"params": other_params, "lr": LSTM_LR}], weight_decay=WEIGHT_DECAY)
+
     total_steps = len(train_loader) * epochs
     scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=int(total_steps * warmup_ratio),
-        num_training_steps=total_steps)
+        optimizer, num_warmup_steps=int(total_steps * 0.10), num_training_steps=total_steps)
+
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    best_score, best_state = -np.inf, None
+    best_f1, best_state = -1, None
 
     for epoch in range(epochs):
-        # ---- Training ----
-        model.train(); total_train_loss, train_steps = 0.0, 0
+        model.train(); total_loss = 0.0
         for batch in train_loader:
-            batch = {k: v.to(device) for k, v in batch.items()}
             optimizer.zero_grad(set_to_none=True)
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            token_type_ids = batch.get("token_type_ids")
+            if token_type_ids is not None: token_type_ids = token_type_ids.to(device)
+            labels = {label: batch[label].to(device) for label in LABELS}
+
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-                outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
-                                token_type_ids=batch.get("token_type_ids"))
-                loss = calculate_loss(outputs, batch, class_weights)
-            if loss is None: continue
+                logits = model(input_ids=input_ids, attention_mask=attention_mask,
+                               token_type_ids=token_type_ids)
+                loss = calculate_loss(logits, labels)
+
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP)
             scaler.step(optimizer); scaler.update(); scheduler.step()
-            total_train_loss += loss.item(); train_steps += 1
-        avg_train_loss = total_train_loss / max(train_steps, 1)
+            total_loss += loss.item()
 
-        # ---- Validation ----
         val_results = validate_model(model, val_loader)
+        avg_train_loss = total_loss / len(train_loader)
         print(f"\nEpoch {epoch+1}/{epochs}")
         print(f"Train Loss: {avg_train_loss:.4f}")
-        for label in LABEL_COLS:
+        print(f"Val Loss: {val_results['loss']:.4f}")
+        for label in LABELS:
             if label in val_results:
-                print(f"{label:<10} | Acc: {val_results[label]['accuracy']:.4f} | "
-                      f"Macro-F1: {val_results[label]['macro_f1']:.4f}")
-        avg_f1 = val_results["average_macro_f1"]
-        print(f"Average Macro-F1: {avg_f1:.4f}")
+                print(f"{label}: Acc={val_results[label]['accuracy']:.4f} "
+                      f"Macro-F1={val_results[label]['macro_f1']:.4f}")
+        print(f"Average Macro-F1: {val_results['average_macro_f1']:.4f}")
 
-        # ---- Save best ----
-        if avg_f1 > best_score:
-            best_score = avg_f1
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            print("✓ Best model updated")
+        if val_results["average_macro_f1"] > best_f1:
+            best_f1 = val_results["average_macro_f1"]
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            print("✓ Best model saved")
 
-    if best_state is not None: model.load_state_dict(best_state)
+    model.load_state_dict(best_state)
     return model.to(device)
 
-# 11. Final test evaluation
-def evaluate_model(model, test_loader):
+# 14. EVALUATION
+@torch.no_grad()
+def evaluate_model(model, dataloader):
     model.eval()
-    all_preds = {l: [] for l in LABEL_COLS}
-    all_labels = {l: [] for l in LABEL_COLS}
-    with torch.no_grad():
-        for batch in test_loader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
-                            token_type_ids=batch.get("token_type_ids"))
-            for label in LABEL_COLS:
-                labels = batch[f"{label}_label"]
-                valid_mask = labels != -1
-                if valid_mask.sum() == 0: continue
-                preds = torch.argmax(outputs[label][valid_mask], dim=1)
-                all_preds[label].extend(preds.cpu().numpy())
-                all_labels[label].extend(labels[valid_mask].cpu().numpy())
+    predictions = {l: [] for l in LABELS}
+    targets = {l: [] for l in LABELS}
 
-    results = []
-    for label in LABEL_COLS:
-        accuracy = accuracy_score(all_labels[label], all_preds[label])
-        macro_f1 = f1_score(all_labels[label], all_preds[label], average="macro")
-        class_names = [label_mappings[label]["id2label"][i] for i in range(num_classes[label])]
-        print("\n" + "=" * 65)
-        print(f"MARBERT Fine-Tuned Multi-Head: {label}")
-        print("=" * 65)
-        print(f"Accuracy : {accuracy:.4f}")
-        print(f"Macro-F1 : {macro_f1:.4f}")
-        print("\nClassification Report:")
-        print(classification_report(all_labels[label], all_preds[label],
-                                    target_names=class_names, zero_division=0))
-        results.append({"model": "MARBERT Fine-Tuned Multi-Head", "label": label,
-                        "accuracy": accuracy, "macro_f1": macro_f1})
-    return results
+    for batch in dataloader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        token_type_ids = batch.get("token_type_ids")
+        if token_type_ids is not None: token_type_ids = token_type_ids.to(device)
 
-# 12. Train / validation / test split
-indices = np.arange(len(df))
-train_idx, test_idx = train_test_split(indices, test_size=0.20, random_state=SEED)
-train_idx, val_idx = train_test_split(train_idx, test_size=0.10, random_state=SEED)
+        logits = model(input_ids=input_ids, attention_mask=attention_mask,
+                       token_type_ids=token_type_ids)
+        for label in LABELS:
+            labels = batch[label].to(device)
+            valid_mask = labels != -1
+            if valid_mask.sum() == 0: continue
+            pred = torch.argmax(logits[label], dim=1)
+            predictions[label].extend(pred[valid_mask].cpu().numpy())
+            targets[label].extend(labels[valid_mask].cpu().numpy())
 
-train_df = df.iloc[train_idx].reset_index(drop=True)
-val_df = df.iloc[val_idx].reset_index(drop=True)
-test_df = df.iloc[test_idx].reset_index(drop=True)
-print(f"\nTrain: {len(train_df)} | Validation: {len(val_df)} | Test: {len(test_df)}")
+    for label in LABELS:
+        print("\n" + "=" * 70)
+        print(f"{label} CLASSIFICATION")
+        print("=" * 70)
+        print(classification_report(targets[label], predictions[label], digits=4, zero_division=0))
+        print(f"{label} Accuracy: {accuracy_score(targets[label], predictions[label]):.4f}")
+        print(f"{label} Macro-F1: {f1_score(targets[label], predictions[label], average='macro', zero_division=0):.4f}")
 
-# 13. Class weights
-class_weights = {label: get_class_weights(train_df, label) for label in LABEL_COLS}
-for label in LABEL_COLS:
-    print(f"\n{label} class weights:")
-    print(class_weights[label].detach().cpu().numpy())
+# 15. DATASETS
+train_dataset = MultiTaskDataset(train_df, tokenizer, MAX_LENGTH)
+val_dataset = MultiTaskDataset(val_df, tokenizer, MAX_LENGTH)
+test_dataset = MultiTaskDataset(test_df, tokenizer, MAX_LENGTH)
 
-# 14. Datasets
-BATCH_SIZE, EPOCHS, LEARNING_RATE, MAX_LENGTH = 16, 3, 2e-5, 64
+# 16. DATALOADERS
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                          pin_memory=(device.type == "cuda"), num_workers=2)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                        pin_memory=(device.type == "cuda"), num_workers=2)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                         pin_memory=(device.type == "cuda"), num_workers=2)
 
-train_dataset = MultiTaskDataset(train_df, tokenizer, label_mappings, MAX_LENGTH)
-val_dataset = MultiTaskDataset(val_df, tokenizer, label_mappings, MAX_LENGTH)
-test_dataset = MultiTaskDataset(test_df, tokenizer, label_mappings, MAX_LENGTH)
+# 17. CREATE MODEL
+model = MARBERT_BiLSTM_MultiHead(num_classes=num_classes,
+                                 lstm_hidden_size=LSTM_HIDDEN_SIZE,
+                                 dropout=DROPOUT).to(device)
+print(model)
 
-# 15. DataLoaders
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+# 18. TRAIN
+model = train_model(model, train_loader, val_loader, epochs=EPOCHS)
 
-# 16. Create ONE MARBERT multi-head model
-model = MARBERTMultiHead(num_classes=num_classes, dropout=0.3).to(device)
-print("\nModel:"); print(model)
-
-# 17. Fine-tune MARBERT end-to-end
-model = train_model(model, train_loader, val_loader, class_weights=class_weights,
-                    epochs=EPOCHS, learning_rate=LEARNING_RATE, warmup_ratio=0.1)
-
-# 18. Evaluate
-results = evaluate_model(model, test_loader)
-
-# 19. Final results
-results_df = pd.DataFrame(results)
-print("\n" + "=" * 65)
-print("FINAL RESULTS")
-print("=" * 65)
-print(results_df)
+# 19. FINAL TEST EVALUATION
+evaluate_model(model, test_loader)

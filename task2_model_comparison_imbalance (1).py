@@ -1,4 +1,3 @@
-# MARBERT + Per-Task Attention + Multi-Head Multi-Task
 import re, random
 import numpy as np, pandas as pd, torch, torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -15,15 +14,20 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", device)
 
 # 2. CONFIGURATION
-MARBERT_MODEL_NAME = "UBC-NLP/MARBERT"
+MARBERT_MODEL_NAME = "UBC-NLP/MARBERTv2"
 MAX_LENGTH, BATCH_SIZE, EPOCHS = 128, 16, 8
 MARBERT_LR, HEAD_LR = 1e-5, 2e-4
 WEIGHT_DECAY, DROPOUT, GRADIENT_CLIP = 0.01, 0.30, 1.0
 LOSS_WEIGHTS = {"Emotion": 1.5, "Offensive": 1.0, "Hate": 1.0}   # Emotion gets more weight
 
 # 3. LOAD DATA
-df = pd.read_csv("train.csv")
-print(df.head()); print(df.columns)
+train_df = pd.read_csv("train.csv")
+val_df = pd.read_csv("validation.csv")
+test_df = pd.read_csv("test.csv")
+
+print("Train Data Head:"); print(train_df.head()); print(train_df.columns)
+print("Validation Data Head:"); print(val_df.head()); print(val_df.columns)
+print("Test Data Head:"); print(test_df.head()); print(test_df.columns)
 
 # 4. PREPROCESSING
 arabert_preprocessor = ArabertPreprocessor(model_name="aubmindlab/bert-base-arabertv02-twitter")
@@ -33,30 +37,48 @@ def preprocess_text(text):
     text = re.sub(r'https?://\S+|www\.\S+', '', text)              # Remove URLs
     text = re.sub(r'@\S+', '', text)                                # Remove mentions
     text = re.sub(r'(.)\1{2,}', r'\1', text)                        # Reduce repeated chars
-    text = ''.join(ch for ch in text                               # Remove emoji/symbols
-                   if not (0x1F300 <= ord(ch) <= 0x1FAFF))
+    # text = ''.join(ch for ch in text                               # Remove emoji/symbols
+    #                if not (0x1F300 <= ord(ch) <= 0x1FAFF))
     return arabert_preprocessor.preprocess(text)                    # AraBERT preprocessing
 
-df["text"] = df["text"].fillna("").apply(preprocess_text)
-print(df[["text", "Emotion", "Offensive", "Hate"]].head())
+train_df["text"] = train_df["text"].fillna("").apply(preprocess_text)
+val_df["text"] = val_df["text"].fillna("").apply(preprocess_text)
+test_df["text"] = test_df["text"].fillna("").apply(preprocess_text)
+
+print("\nPreprocessed Train Data Head:"); print(train_df[["text", "Emotion", "Offensive", "Hate"]].head())
+print("\nPreprocessed Validation Data Head:"); print(val_df[["text", "Emotion", "Offensive", "Hate"]].head())
+print("\nPreprocessed Test Data Head:"); print(test_df[["text", "Emotion", "Offensive", "Hate"]].head())
 
 # 5. LABEL ENCODING
 LABELS = ["Emotion", "Offensive", "Hate"]
 label_maps, num_classes = {}, {}
 
+# Process train_df to establish label_maps and num_classes
 for label in LABELS:
-    df[label] = df[label].astype(str)                               # Avoid mixed-type issues
-    unique_labels = sorted(df[label].unique())
+    train_df[label] = train_df[label].astype(str)
+    unique_labels = sorted(train_df[label].unique())
     label_maps[label] = {name: idx for idx, name in enumerate(unique_labels)}
-    df[label + "_label"] = df[label].map(label_maps[label])
+    train_df[label + "_label"] = train_df[label].map(label_maps[label])
     num_classes[label] = len(unique_labels)
     print(f"{label}: {num_classes[label]} classes"); print(label_maps[label])
 
-# 6. TRAIN / VALIDATION / TEST SPLIT
-train_df, temp_df = train_test_split(df, test_size=0.20, random_state=SEED, shuffle=True)
-val_df, test_df = train_test_split(temp_df, test_size=0.50, random_state=SEED, shuffle=True)
+# Apply label mapping to val_df and test_df using the maps learned from train_df
+for label in LABELS:
+    val_df[label] = val_df[label].astype(str)
+    test_df[label] = test_df[label].astype(str)
+    val_df[label + "_label"] = val_df[label].map(label_maps[label])
+    test_df[label + "_label"] = test_df[label].map(label_maps[label])
+
+print("\nLabel Encoded Train Data Head:"); print(train_df[["text", "Emotion", "Emotion_label", "Offensive", "Hate"]].head())
+print("\nLabel Encoded Validation Data Head:"); print(val_df[["text", "Emotion", "Emotion_label", "Offensive", "Hate"]].head())
+print("\nLabel Encoded Test Data Head:"); print(test_df[["text", "Emotion", "Emotion_label", "Offensive", "Hate"]].head())
+
+# 6. TRAIN / VALIDATION / TEST SPLIT (Removed 'LOAD DATA' as it's handled above)
+
 print("\nDataset sizes:")
-print("Train:", len(train_df)); print("Validation:", len(val_df)); print("Test:", len(test_df))
+print("Train:", len(train_df))
+print("Validation:", len(val_df))
+print("Test:", len(test_df))
 
 # 7. TOKENIZER
 tokenizer = AutoTokenizer.from_pretrained(MARBERT_MODEL_NAME)
@@ -112,7 +134,7 @@ class MARBERT_MultiHead(nn.Module):
     Architecture:
 
         MARBERT (shared) → token representations
-                                │
+                                |
               ┌─────────────────┼─────────────────┐
               │                 │                 │
               ▼                 ▼                 ▼

@@ -1,4 +1,4 @@
-# MARBERT + 2x BiLSTM + Attention + Multi-Head Multi-Task
+# MARBERT + Per-Task Attention + Multi-Head Multi-Task
 import re, random
 import numpy as np, pandas as pd, torch, torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -17,8 +17,8 @@ print("Device:", device)
 # 2. CONFIGURATION
 MARBERT_MODEL_NAME = "UBC-NLP/MARBERT"
 MAX_LENGTH, BATCH_SIZE, EPOCHS = 128, 16, 8
-MARBERT_LR, LSTM_LR = 1e-5, 2e-4
-WEIGHT_DECAY, DROPOUT, LSTM_HIDDEN_SIZE, GRADIENT_CLIP = 0.01, 0.30, 256, 1.0
+MARBERT_LR, HEAD_LR = 1e-5, 2e-4
+WEIGHT_DECAY, DROPOUT, GRADIENT_CLIP = 0.01, 0.30, 1.0
 LOSS_WEIGHTS = {"Emotion": 1.5, "Offensive": 1.0, "Hate": 1.0}   # Emotion gets more weight
 
 # 3. LOAD DATA
@@ -83,52 +83,124 @@ class MultiTaskDataset(Dataset):
         return item
 
 # 9. MODEL
-class MARBERT_BiLSTM_MultiHead(nn.Module):
-    def __init__(self, num_classes, lstm_hidden_size=256, dropout=0.3):
+class TaskAttentionPool(nn.Module):
+    """Per-task attention pooling over MARBERT token states (FP16-safe).
+
+    Each task (Emotion / Offensive / Hate) gets its OWN instance of this module,
+    so each learns its own notion of which tokens matter.
+    """
+    def __init__(self, hidden_size):
         super().__init__()
-        self.marbert = AutoModel.from_pretrained(MARBERT_MODEL_NAME)
-        marbert_hidden_size = self.marbert.config.hidden_size
+        self.query = nn.Linear(hidden_size, 1)
 
-        # Two stacked BiLSTMs
-        self.lstm1 = nn.LSTM(marbert_hidden_size, lstm_hidden_size, num_layers=1,
-                             batch_first=True, bidirectional=True)
-        self.dropout1 = nn.Dropout(dropout)
-        self.lstm2 = nn.LSTM(lstm_hidden_size * 2, lstm_hidden_size, num_layers=1,
-                             batch_first=True, bidirectional=True)
-        self.dropout2 = nn.Dropout(dropout)
-
-        # Attention
-        self.attention = nn.Linear(lstm_hidden_size * 2, 1)
-
-        # Task heads
-        rep_size = lstm_hidden_size * 2
-        def make_head(n): return nn.Sequential(nn.Linear(rep_size, rep_size), nn.ReLU(),
-                                               nn.Dropout(dropout), nn.Linear(rep_size, n))
-        self.emotion_head = make_head(num_classes["Emotion"])
-        self.offensive_head = make_head(num_classes["Offensive"])
-        self.hate_head = make_head(num_classes["Hate"])
-
-    def attention_pooling(self, sequence_output, attention_mask):
-        scores = self.attention(sequence_output).squeeze(-1)
+    def forward(self, sequence_output, attention_mask):
+        # sequence_output: (B, T, H)
+        scores = self.query(sequence_output).squeeze(-1)
 
         # Masking + softmax in FP32 to avoid FP16 overflow/underflow
         scores = scores.float().masked_fill(
             attention_mask == 0, torch.finfo(torch.float32).min)
         weights = torch.softmax(scores, dim=1)
 
-        # Back to original dtype before multiplying with LSTM output
+        # Back to original dtype before multiplying with MARBERT output
         weights = weights.to(sequence_output.dtype).unsqueeze(-1)
         return torch.sum(sequence_output * weights, dim=1)
 
+
+class MARBERT_MultiHead(nn.Module):
+    """
+    Architecture:
+
+        MARBERT (shared) → token representations
+                                │
+              ┌─────────────────┼─────────────────┐
+              │                 │                 │
+              ▼                 ▼                 ▼
+          Emotion           Offensive            Hate
+         Attention          Attention          Attention
+              │                 │                 │
+         ┌────┼────┐       ┌────┼────┐       ┌────┼────┐
+         │    │    │       │    │    │       │    │    │
+        Mean Max Attn     Mean Max Attn     Mean Max Attn
+         │    │    │       │    │    │       │    │    │
+         └────┼────┘       └────┼────┘       └────┼────┘
+              ▼                 ▼                 ▼
+           Fusion            Fusion            Fusion
+              ▼                 ▼                 ▼
+          Emotion           Offensive            Hate
+           Head               Head               Head
+              ▼                 ▼                 ▼
+         12 classes          Yes/No         Hate classes
+
+    Mean & Max pooling are shared (computed once on the token reps).
+    Attention, Fusion, and Head are per-task.
+    """
+    def __init__(self, num_classes, dropout=0.3):
+        super().__init__()
+        self.marbert = AutoModel.from_pretrained(MARBERT_MODEL_NAME)
+        h = self.marbert.config.hidden_size   # 768 for MARBERT
+
+        # ---- Per-task attention pools (one per task) ----
+        self.emotion_attention   = TaskAttentionPool(h)
+        self.offensive_attention = TaskAttentionPool(h)
+        self.hate_attention      = TaskAttentionPool(h)
+
+        # ---- Per-task fusion layers: concat(mean, max, attn) → h ----
+        # 768 + 768 + 768 = 2304 → Linear(2304 → 768) → GELU → Dropout
+        def make_fusion():
+            return nn.Sequential(nn.Linear(h * 3, h),
+                                 nn.GELU(),
+                                 nn.Dropout(dropout))
+        self.emotion_fusion   = make_fusion()
+        self.offensive_fusion = make_fusion()
+        self.hate_fusion      = make_fusion()
+
+        # ---- Per-task classifier heads ----
+        def make_head(n):
+            return nn.Sequential(nn.Linear(h, h), nn.ReLU(),
+                                 nn.Dropout(dropout), nn.Linear(h, n))
+        self.emotion_head   = make_head(num_classes["Emotion"])
+        self.offensive_head = make_head(num_classes["Offensive"])
+        self.hate_head      = make_head(num_classes["Hate"])
+
+    # ---- Shared pooling helpers (computed once, reused by all tasks) ----
+    @staticmethod
+    def mean_pool(hidden, mask):
+        m = mask.unsqueeze(-1).float()
+        return (hidden * m).sum(1) / m.sum(1).clamp(min=1e-9)
+
+    @staticmethod
+    def max_pool(hidden, mask):
+        m = mask.unsqueeze(-1).float()
+        neg_inf = torch.finfo(hidden.dtype).min
+        hidden = hidden.masked_fill(m == 0, neg_inf)
+        return hidden.max(dim=1).values
+
     def forward(self, input_ids, attention_mask, token_type_ids=None):
+        # 1. Shared MARBERT backbone
         x = self.marbert(input_ids=input_ids, attention_mask=attention_mask,
                          token_type_ids=token_type_ids).last_hidden_state
-        x, _ = self.lstm1(x); x = self.dropout1(x)
-        x, _ = self.lstm2(x); x = self.dropout2(x)
-        pooled = self.attention_pooling(x, attention_mask)
-        return {"Emotion": self.emotion_head(pooled),
-                "Offensive": self.offensive_head(pooled),
-                "Hate": self.hate_head(pooled)}
+
+        # 2. Shared mean & max pools (computed once)
+        mean_p = self.mean_pool(x, attention_mask)
+        max_p  = self.max_pool(x, attention_mask)
+
+        # 3. Per-task branch: attention → concat → fusion → head
+        # --- Emotion ---
+        attn_e = self.emotion_attention(x, attention_mask)
+        fused_e = self.emotion_fusion(torch.cat([mean_p, max_p, attn_e], dim=-1))
+
+        # --- Offensive ---
+        attn_o = self.offensive_attention(x, attention_mask)
+        fused_o = self.offensive_fusion(torch.cat([mean_p, max_p, attn_o], dim=-1))
+
+        # --- Hate ---
+        attn_h = self.hate_attention(x, attention_mask)
+        fused_h = self.hate_fusion(torch.cat([mean_p, max_p, attn_h], dim=-1))
+
+        return {"Emotion":   self.emotion_head(fused_e),
+                "Offensive": self.offensive_head(fused_o),
+                "Hate":      self.hate_head(fused_h)}
 
 # 10. CLASS WEIGHTS
 def get_class_weights(dataframe, label, num_classes):
@@ -195,15 +267,21 @@ def validate_model(model, dataloader):
 
 # 13. TRAINING
 def train_model(model, train_loader, val_loader, epochs=8):
-    # Different LRs: small for MARBERT, larger for LSTM + heads
+    # Different LRs: small for MARBERT, larger for task modules
     marbert_params = list(model.marbert.parameters())
-    other_params = (list(model.lstm1.parameters()) + list(model.lstm2.parameters()) +
-                    list(model.attention.parameters()) + list(model.emotion_head.parameters()) +
-                    list(model.offensive_head.parameters()) + list(model.hate_head.parameters()))
+    other_params = (list(model.emotion_attention.parameters()) +
+                    list(model.offensive_attention.parameters()) +
+                    list(model.hate_attention.parameters()) +
+                    list(model.emotion_fusion.parameters()) +
+                    list(model.offensive_fusion.parameters()) +
+                    list(model.hate_fusion.parameters()) +
+                    list(model.emotion_head.parameters()) +
+                    list(model.offensive_head.parameters()) +
+                    list(model.hate_head.parameters()))
 
     optimizer = torch.optim.AdamW(
         [{"params": marbert_params, "lr": MARBERT_LR},
-         {"params": other_params, "lr": LSTM_LR}], weight_decay=WEIGHT_DECAY)
+         {"params": other_params, "lr": HEAD_LR}], weight_decay=WEIGHT_DECAY)
 
     total_steps = len(train_loader) * epochs
     scheduler = get_linear_schedule_with_warmup(
@@ -253,7 +331,7 @@ def train_model(model, train_loader, val_loader, epochs=8):
     model.load_state_dict(best_state)
     return model.to(device)
 
-# 14. EVALUATION
+# 14. EVALUATION (per-task)
 @torch.no_grad()
 def evaluate_model(model, dataloader):
     model.eval()
@@ -284,6 +362,18 @@ def evaluate_model(model, dataloader):
         print(f"{label} Accuracy: {accuracy_score(targets[label], predictions[label]):.4f}")
         print(f"{label} Macro-F1: {f1_score(targets[label], predictions[label], average='macro', zero_division=0):.4f}")
 
+    # Return per-task metrics so the final average block can use them
+    results = {}
+    for label in LABELS:
+        if len(targets[label]) == 0: continue
+        results[label] = {
+            "accuracy": accuracy_score(targets[label], predictions[label]),
+            "macro_f1": f1_score(targets[label], predictions[label],
+                                 average="macro", zero_division=0),
+            "weighted_f1": f1_score(targets[label], predictions[label],
+                                    average="weighted", zero_division=0)}
+    return results
+
 # 15. DATASETS
 train_dataset = MultiTaskDataset(train_df, tokenizer, MAX_LENGTH)
 val_dataset = MultiTaskDataset(val_df, tokenizer, MAX_LENGTH)
@@ -298,13 +388,23 @@ test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
                          pin_memory=(device.type == "cuda"), num_workers=2)
 
 # 17. CREATE MODEL
-model = MARBERT_BiLSTM_MultiHead(num_classes=num_classes,
-                                 lstm_hidden_size=LSTM_HIDDEN_SIZE,
-                                 dropout=DROPOUT).to(device)
+model = MARBERT_MultiHead(num_classes=num_classes, dropout=DROPOUT).to(device)
 print(model)
 
 # 18. TRAIN
 model = train_model(model, train_loader, val_loader, epochs=EPOCHS)
 
 # 19. FINAL TEST EVALUATION
-evaluate_model(model, test_loader)
+results = evaluate_model(model, test_loader)
+
+# 20. AVERAGE EVALUATION (across all 3 tasks)
+results_df = pd.DataFrame(results).T.reset_index()
+results_df = results_df.rename(columns={"index": "Task"})
+
+print("\n" + "=" * 65)
+print("FINAL TEST RESULTS (MARBERT Multi-Head — Per-Task Attention)")
+print("=" * 65)
+print(results_df.to_string(index=False))
+print(f"\nMean Accuracy    : {results_df['accuracy'].mean():.4f}")
+print(f"Mean Macro-F1    : {results_df['macro_f1'].mean():.4f}")
+print(f"Mean Weighted-F1 : {results_df['weighted_f1'].mean():.4f}")
